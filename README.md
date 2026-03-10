@@ -1,2 +1,2 @@
 # gcnn
-Implementation of Graph-Equivariant Convolutional Networks
+Implementation of Group-Equivariant Convolutional Networks
