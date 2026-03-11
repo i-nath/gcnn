@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import math
 import random
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
@@ -250,6 +253,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path for the best checkpoint, updated when validation loss improves.",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.9999,
+        help="Exponential moving average decay for model parameters.",
+    )
+    parser.add_argument(
+        "--num-sample-steps",
+        type=int,
+        default=100,
+        help="Number of Euler integration steps used for image generation.",
+    )
+    parser.add_argument(
+        "--num-eval-samples",
+        type=int,
+        default=16,
+        help="Number of images to sample during periodic evaluation.",
+    )
+    parser.add_argument(
+        "--num-final-samples",
+        type=int,
+        default=16,
+        help="Number of images to sample at the end of training.",
+    )
+    parser.add_argument(
+        "--sample-batch-size",
+        type=int,
+        default=16,
+        help="Batch size used during sampling.",
+    )
+    parser.add_argument(
+        "--sample-every-epochs",
+        type=int,
+        default=16,
+        help="Save sampled images every N epochs. Set to 0 to disable periodic sampling.",
+    )
+    parser.add_argument(
+        "--samples-dir",
+        type=Path,
+        default=Path("samples") / "flow_matching",
+        help="Directory where generated sample grids are written.",
+    )
     return parser
 
 
@@ -305,6 +350,10 @@ def build_config_defaults(
         defaults["cosine_t_max"] = scheduler_config["t_max"]
     if "eta_min" in scheduler_config:
         defaults["cosine_eta_min"] = scheduler_config["eta_min"]
+
+    ema_config = training_config.get("ema", {})
+    if "decay" in ema_config:
+        defaults["ema_decay"] = ema_config["decay"]
 
     models_config = config.get("models", {})
     model_config = models_config.get(model, {}).get(model_size)
@@ -463,6 +512,35 @@ def build_optimizer(args: argparse.Namespace, model: nn.Module) -> Optimizer:
     raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
+def build_ema_model(args: argparse.Namespace, model: nn.Module) -> nn.Module | None:
+    if not (0.0 < args.ema_decay <= 1.0):
+        raise ValueError(f"ema_decay must be in (0, 1], got {args.ema_decay}")
+
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    ema_model.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    ema_params = dict(ema_model.named_parameters())
+    model_params = dict(model.named_parameters())
+    if ema_params.keys() != model_params.keys():
+        raise ValueError("EMA model parameters do not match training model parameters")
+
+    for name, ema_param in ema_params.items():
+        ema_param.lerp_(model_params[name].detach(), 1.0 - decay)
+
+    ema_buffers = dict(ema_model.named_buffers())
+    model_buffers = dict(model.named_buffers())
+    if ema_buffers.keys() != model_buffers.keys():
+        raise ValueError("EMA model buffers do not match training model buffers")
+
+    for name, ema_buffer in ema_buffers.items():
+        ema_buffer.copy_(model_buffers[name].detach())
+
+
 def normalize_cifar_images(images: Tensor) -> Tensor:
     return images * 2.0 - 1.0
 
@@ -477,8 +555,117 @@ def sample_flow_matching_batch(images: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     return xt, t, target_velocity
 
 
+def denormalize_cifar_images(images: Tensor) -> Tensor:
+    return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def generate_samples(
+    model: nn.Module,
+    *,
+    num_samples: int,
+    image_size: int,
+    in_channels: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    num_steps: int,
+    batch_size: int,
+) -> Tensor:
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be at least 1, got {num_steps}")
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be at least 1, got {num_samples}")
+    if batch_size < 1:
+        raise ValueError(f"sample_batch_size must be at least 1, got {batch_size}")
+
+    model_was_training = model.training
+    model.eval()
+
+    generated_batches: list[Tensor] = []
+    dt = 1.0 / num_steps
+    time_values = torch.linspace(0.0, 1.0 - dt, steps=num_steps, device=device)
+
+    remaining = num_samples
+    while remaining > 0:
+        current_batch_size = min(batch_size, remaining)
+        x = torch.randn(
+            current_batch_size,
+            in_channels,
+            image_size,
+            image_size,
+            device=device,
+        )
+        for t_value in time_values:
+            t = torch.full((current_batch_size,), t_value, device=device, dtype=x.dtype)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None,
+            ):
+                velocity = model(x, t)
+            x = x + dt * velocity
+        generated_batches.append(denormalize_cifar_images(x).cpu())
+        remaining -= current_batch_size
+
+    if model_was_training:
+        model.train()
+    return torch.cat(generated_batches, dim=0)
+
+
+def save_image_grid(images: Tensor, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    images = images.detach().cpu()
+    num_images = images.shape[0]
+    grid_cols = math.ceil(math.sqrt(num_images))
+    grid_rows = math.ceil(num_images / grid_cols)
+    height, width = images.shape[-2:]
+
+    canvas = np.ones((grid_rows * height, grid_cols * width, 3), dtype=np.float32)
+    for index, image in enumerate(images):
+        row = index // grid_cols
+        col = index % grid_cols
+        image_np = image.permute(1, 2, 0).numpy()
+        if image_np.shape[-1] == 1:
+            image_np = np.repeat(image_np, 3, axis=-1)
+        canvas[
+            row * height : (row + 1) * height,
+            col * width : (col + 1) * width,
+        ] = image_np
+
+    plt.imsave(path, canvas)
+
+
+def maybe_generate_and_save_samples(
+    *,
+    model: nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    filename: str,
+) -> Path | None:
+    if args.samples_dir is None:
+        return None
+
+    num_samples = args.num_eval_samples if filename.startswith("epoch_") else args.num_final_samples
+    samples = generate_samples(
+        model,
+        num_samples=num_samples,
+        image_size=DATASET_SPECS["image_size"],
+        in_channels=DATASET_SPECS["in_channels"],
+        device=device,
+        amp_dtype=amp_dtype,
+        num_steps=args.num_sample_steps,
+        batch_size=args.sample_batch_size,
+    )
+    output_path = args.samples_dir / filename
+    save_image_grid(samples, output_path)
+    return output_path
+
+
 def train_one_epoch(
     model: nn.Module,
+    ema_model: nn.Module | None,
+    ema_decay: float,
     loader: DataLoader,
     optimizer: Optimizer,
     scaler: torch.amp.GradScaler | None,
@@ -529,6 +716,8 @@ def train_one_epoch(
         if optimizer_stepped:
             if scheduler is not None:
                 scheduler.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, model, ema_decay)
             global_step += 1
 
         batch_size = images.shape[0]
@@ -676,6 +865,7 @@ def maybe_init_wandb(
 def maybe_save_checkpoint(
     path: Path | None,
     model: nn.Module,
+    ema_model: nn.Module | None,
     optimizer: Optimizer,
     scaler: torch.amp.GradScaler | None,
     scheduler: CosineAnnealingLR | None,
@@ -695,6 +885,7 @@ def maybe_save_checkpoint(
     torch.save(
         {
             "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": None if ema_model is None else ema_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": None if scaler is None else scaler.state_dict(),
             "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
@@ -715,6 +906,7 @@ def maybe_save_checkpoint(
 def maybe_resume_from_checkpoint(
     path: Path | None,
     model: nn.Module,
+    ema_model: nn.Module | None,
     optimizer: Optimizer,
     scaler: torch.amp.GradScaler | None,
     scheduler: CosineAnnealingLR | None,
@@ -726,6 +918,11 @@ def maybe_resume_from_checkpoint(
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
+    ema_model_state_dict = checkpoint.get("ema_model_state_dict")
+    if ema_model is not None and ema_model_state_dict is not None:
+        ema_model.load_state_dict(ema_model_state_dict)
+    elif ema_model is not None:
+        ema_model.load_state_dict(checkpoint["model_state_dict"])
 
     optimizer_state_dict = checkpoint.get("optimizer_state_dict")
     if optimizer_state_dict is not None:
@@ -781,6 +978,7 @@ def main() -> None:
     )
     amp_dtype = resolve_amp_dtype(args, device)
     model = build_model(args).to(device)
+    ema_model = build_ema_model(args, model).to(device)
     optimizer = build_optimizer(args, model)
     scaler = build_grad_scaler(args, device, amp_dtype)
     scheduler = build_scheduler(args, optimizer, train_steps_per_epoch)
@@ -794,6 +992,7 @@ def main() -> None:
     ) = maybe_resume_from_checkpoint(
         path=args.resume,
         model=model,
+        ema_model=ema_model,
         optimizer=optimizer,
         scaler=scaler,
         scheduler=scheduler,
@@ -825,6 +1024,7 @@ def main() -> None:
     print(f"Train examples: {len(train_loader.dataset)}")
     print(f"Val examples: {len(val_loader.dataset)}")
     print(f"Test examples: {len(test_loader.dataset)}")
+    print(f"Samples dir: {args.samples_dir}")
 
     run_start_time = time.perf_counter()
     for epoch in range(start_epoch, args.epochs + 1):
@@ -837,6 +1037,8 @@ def main() -> None:
             running_examples_total,
         ) = train_one_epoch(
             model=model,
+            ema_model=ema_model,
+            ema_decay=args.ema_decay,
             loader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
@@ -852,7 +1054,7 @@ def main() -> None:
             wandb_run=wandb_run,
         )
         val_loss = evaluate(
-            model=model,
+            model=ema_model,
             loader=val_loader,
             device=device,
             amp_dtype=amp_dtype,
@@ -872,25 +1074,37 @@ def main() -> None:
 
         is_best_checkpoint = val_loss < best_eval_loss
         best_eval_loss = min(best_eval_loss, val_loss)
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "epoch": epoch,
-                    "train/global_step": global_step,
-                    "train/loss": train_loss,
-                    "lr": optimizer.param_groups[0]["lr"],
-                    "val/loss": val_loss,
-                    "elapsed_time_sec": elapsed_time_sec,
-                    "total_elapsed_time_sec": total_elapsed_time_sec,
-                    "best_val_loss": best_eval_loss,
-                },
-                step=global_step,
+        sample_path: Path | None = None
+        if args.sample_every_epochs > 0 and epoch % args.sample_every_epochs == 0:
+            sample_path = maybe_generate_and_save_samples(
+                model=ema_model,
+                args=args,
+                device=device,
+                amp_dtype=amp_dtype,
+                filename=f"epoch_{epoch:04d}.png",
             )
+            if sample_path is not None:
+                print(f"saved_samples={sample_path}")
+        if wandb_run is not None:
+            log_payload: dict[str, Any] = {
+                "epoch": epoch,
+                "train/global_step": global_step,
+                "train/loss": train_loss,
+                "lr": optimizer.param_groups[0]["lr"],
+                "val/loss": val_loss,
+                "elapsed_time_sec": elapsed_time_sec,
+                "total_elapsed_time_sec": total_elapsed_time_sec,
+                "best_val_loss": best_eval_loss,
+            }
+            if sample_path is not None:
+                log_payload["samples/val_grid"] = wandb.Image(str(sample_path))
+            wandb_run.log(log_payload, step=global_step)
             wandb_run.summary["best_val_loss"] = best_eval_loss
 
         maybe_save_checkpoint(
             path=args.save_last_checkpoint,
             model=model,
+            ema_model=ema_model,
             optimizer=optimizer,
             scaler=scaler,
             scheduler=scheduler,
@@ -912,6 +1126,7 @@ def main() -> None:
             maybe_save_checkpoint(
                 path=args.save_best_checkpoint,
                 model=model,
+                ema_model=ema_model,
                 optimizer=optimizer,
                 scaler=scaler,
                 scheduler=scheduler,
@@ -931,20 +1146,29 @@ def main() -> None:
             )
 
     test_loss = evaluate(
-        model=model,
+        model=ema_model,
         loader=test_loader,
         device=device,
         amp_dtype=amp_dtype,
         max_batches=args.max_eval_batches,
     )
     print(f"final_test_loss={test_loss:.4f}")
+    final_sample_path = maybe_generate_and_save_samples(
+        model=ema_model,
+        args=args,
+        device=device,
+        amp_dtype=amp_dtype,
+        filename="final_samples.png",
+    )
+    if final_sample_path is not None:
+        print(f"final_samples={final_sample_path}")
     if wandb_run is not None:
-        wandb_run.log(
-            {
-                "test/final_loss": test_loss,
-            },
-            step=global_step,
-        )
+        final_log_payload: dict[str, Any] = {
+            "test/final_loss": test_loss,
+        }
+        if final_sample_path is not None:
+            final_log_payload["samples/final_grid"] = wandb.Image(str(final_sample_path))
+        wandb_run.log(final_log_payload, step=global_step)
         wandb_run.summary["final_test_loss"] = test_loss
         wandb_run.finish()
 
