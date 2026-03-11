@@ -1,0 +1,69 @@
+dataset:
+  name: cifar10
+  in_channels: 3
+  image_size: 32
+
+training:
+  optimizer:
+    name: adamw
+    lr: 0.0001
+    weight_decay: 0.0001
+  lr_scheduler:
+    name: cosine
+    t_max: null
+    eta_min: 0.0
+  mixed_precision:
+    enabled: true
+    dtype: float16
+
+models:
+  unet:
+    small:
+      channel_dims: [32, 64, 128]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_small_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_small_best.pt
+    base:
+      channel_dims: [48, 96, 192]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_base_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_base_best.pt
+    large:
+      channel_dims: [64, 128, 256]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_large_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_unet_large_best.pt
+
+  p4unet:
+    small:
+      channel_dims: [16, 32, 64]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_small_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_small_best.pt
+    base:
+      channel_dims: [24, 48, 96]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_base_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_base_best.pt
+    large:
+      channel_dims: [32, 64, 128]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_large_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4unet_large_best.pt
+
+  p4munet:
+    small:
+      channel_dims: [11, 23, 45]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_small_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_small_best.pt
+    base:
+      channel_dims: [17, 34, 68]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_base_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_base_best.pt
+    large:
+      channel_dims: [23, 45, 91]
+      checkpointing:
+        save_last_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_large_last.pt
+        save_best_checkpoint: checkpoints/cifar10_flow_matching/cifar10_p4munet_large_best.pt

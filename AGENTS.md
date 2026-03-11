@@ -18,6 +18,13 @@ The goal in this repository is to make safe, useful progress with minimal back-a
 - Do not overwrite or revert user changes you did not make.
 - When requirements are ambiguous, choose the smallest reasonable interpretation and state assumptions briefly in the final message.
 - If you discover a real tradeoff or hidden risk, pause and surface it clearly before taking the risky path.
+- When you learn new repository-specific information that is likely to be useful in future sessions, add it to `AGENTS.md`.
+
+## Environment Notes
+
+- The project virtual environment is not stored inside the repository.
+- The source venv lives at `/tmp/.venvs/gcnn`.
+- Prefer using that environment for validation commands when the task depends on project-installed packages.
 
 ## First Steps
 
@@ -84,6 +91,7 @@ If the user asks for a review:
 - Reuse existing utilities and patterns before creating new ones.
 - Prefer targeted tests over exhaustive runs during iteration.
 - For frontend work, preserve the app's visual language unless the task is explicitly a redesign.
+- For CIFAR-10 model family size presets, preserve the channel-width scaling rule `base : p4 : p4m = 1 : 1/2 : 1/sqrt(8)`, rounding to sensible integers.
 
 ## When To Ask The User
 

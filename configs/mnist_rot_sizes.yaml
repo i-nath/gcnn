@@ -1,0 +1,77 @@
+dataset:
+  name: mnist-rot
+  in_channels: 1
+  num_classes: 10
+  image_size: 28
+
+training:
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.0001
+  label_smoothing: 0.0
+  lr_scheduler:
+    name: cosine
+    t_max: null
+    eta_min: 0.0
+
+models:
+  resnet:
+    small:
+      n_blocks: 4
+      channel_dims: [8, 16, 32]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_resnet_small_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_resnet_small_best.pt
+    base:
+      n_blocks: 4
+      channel_dims: [16, 32, 64]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_resnet_base_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_resnet_base_best.pt
+    large:
+      n_blocks: 4
+      channel_dims: [32, 64, 128]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_resnet_large_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_resnet_large_best.pt
+
+  p4resnet:
+    small:
+      n_blocks: 4
+      channel_dims: [4, 8, 16]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_small_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_small_best.pt
+    base:
+      n_blocks: 4
+      channel_dims: [8, 16, 32]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_base_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_base_best.pt
+    large:
+      n_blocks: 4
+      channel_dims: [16, 32, 64]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_large_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4resnet_large_best.pt
+
+  p4mresnet:
+    small:
+      n_blocks: 4
+      channel_dims: [3, 6, 11]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_small_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_small_best.pt
+    base:
+      n_blocks: 4
+      channel_dims: [6, 11, 23]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_base_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_base_best.pt
+    large:
+      n_blocks: 4
+      channel_dims: [11, 23, 45]
+      checkpointing:
+        save_last_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_large_last.pt
+        save_best_checkpoint: checkpoints/mnist/mnist_rot_p4mresnet_large_best.pt

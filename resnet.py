@@ -1,9 +1,13 @@
 from __future__ import annotations
+import math
 from typing import Literal
+import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 ActivationName = Literal["relu", "gelu", "silu", "tanh", "identity"] | None
+NormalizationName = Literal["batch", "group", "identity"] | None
 
 def build_activation(name: ActivationName) -> nn.Module:
     """Create a small activation module from a string name."""
@@ -20,6 +24,53 @@ def build_activation(name: ActivationName) -> nn.Module:
     raise ValueError(f"Unsupported activation: {name}")
 
 
+def build_norm(
+    name: NormalizationName,
+    num_channels: int,
+    *,
+    num_groups: int = 8,
+) -> nn.Module:
+    """Create a normalization layer for 2D feature maps."""
+    if name in (None, "identity"):
+        return nn.Identity()
+    if name == "batch":
+        return nn.BatchNorm2d(num_channels)
+    if name == "group":
+        if num_groups < 1:
+            raise ValueError(f"num_groups must be at least 1, got {num_groups}")
+        groups = min(num_groups, num_channels)
+        while num_channels % groups != 0:
+            groups -= 1
+        return nn.GroupNorm(groups, num_channels)
+    raise ValueError(f"Unsupported normalization: {name}")
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Create diffusion-style sinusoidal embeddings for scalar timesteps."""
+
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        if embedding_dim < 1:
+            raise ValueError(f"embedding_dim must be at least 1, got {embedding_dim}")
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps: Tensor) -> Tensor:
+        timesteps = timesteps.float()
+        half_dim = self.embedding_dim // 2
+        if half_dim == 0:
+            return timesteps.unsqueeze(-1)
+
+        frequency_step = math.log(10000) / max(half_dim - 1, 1)
+        frequencies = torch.exp(
+            -frequency_step * torch.arange(half_dim, device=timesteps.device, dtype=timesteps.dtype)
+        )
+        angles = timesteps.unsqueeze(-1) * frequencies.unsqueeze(0)
+        embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        if self.embedding_dim % 2 == 1:
+            embedding = F.pad(embedding, (0, 1))
+        return embedding
+
+
 class ConvBlock(nn.Module):
     """Basic convolution -> normalization -> activation block."""
 
@@ -32,14 +83,15 @@ class ConvBlock(nn.Module):
         stride: int = 1,
         padding: int | None = None,
         bias: bool | None = None,
-        use_batch_norm: bool = True,
+        norm: NormalizationName = "batch",
+        norm_groups: int = 8,
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
         if padding is None:
             padding = kernel_size // 2
         if bias is None:
-            bias = not use_batch_norm
+            bias = norm in ("identity", None)
 
         self.conv = nn.Conv2d(
             in_channels,
@@ -49,7 +101,7 @@ class ConvBlock(nn.Module):
             padding=padding,
             bias=bias,
         )
-        self.norm = nn.BatchNorm2d(out_channels) if use_batch_norm else nn.Identity()
+        self.norm = build_norm(norm, out_channels, num_groups=norm_groups)
         self.activation = build_activation(activation)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -67,6 +119,7 @@ class ResidualConvBlock(nn.Module):
         out_channels: int,
         *,
         stride: int = 1,
+        norm: NormalizationName = "batch",
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
@@ -74,11 +127,13 @@ class ResidualConvBlock(nn.Module):
             in_channels,
             out_channels,
             stride=stride,
+            norm=norm,
             activation=activation,
         )
         self.block2 = ConvBlock(
             out_channels,
             out_channels,
+            norm=norm,
             activation=None,
         )
         if in_channels == out_channels and stride == 1:
@@ -86,7 +141,7 @@ class ResidualConvBlock(nn.Module):
         else:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
+                build_norm(norm, out_channels),
             )
         self.activation = build_activation(activation)
 
@@ -138,6 +193,7 @@ class ResNet(nn.Module):
                 out_channels=channel_dims[0],
                 stride=1,
                 n_blocks=n_blocks,
+                norm="batch",
                 activation=activation,
             )
         )
@@ -149,6 +205,7 @@ class ResNet(nn.Module):
                     out_channels=next_channels,
                     stride=2,
                     n_blocks=n_blocks,
+                    norm="batch",
                     activation=activation,
                 )
             )
@@ -164,6 +221,7 @@ class ResNet(nn.Module):
         *,
         stride: int,
         n_blocks: int,
+        norm: NormalizationName,
         activation: ActivationName,
     ) -> nn.Sequential:
         blocks = [
@@ -171,6 +229,7 @@ class ResNet(nn.Module):
                 in_channels,
                 out_channels,
                 stride=stride,
+                norm=norm,
                 activation=activation,
             )
         ]
@@ -180,6 +239,7 @@ class ResNet(nn.Module):
                     out_channels,
                     out_channels,
                     stride=1,
+                    norm=norm,
                     activation=activation,
                 )
             )
@@ -203,10 +263,276 @@ class ResNet(nn.Module):
         return x
 
 
+class UNetResidualBlock(nn.Module):
+    """A diffusion-style residual block with time-based scale-shift modulation."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        time_embedding_dim: int | None = None,
+        norm: NormalizationName = "group",
+        norm_groups: int = 8,
+        activation: ActivationName = "silu",
+    ) -> None:
+        super().__init__()
+        self.norm1 = build_norm(norm, in_channels, num_groups=norm_groups)
+        self.activation1 = build_activation(activation)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = build_norm(norm, out_channels, num_groups=norm_groups)
+        self.activation2 = build_activation(activation)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+        if in_channels == out_channels:
+            self.shortcut = nn.Identity()
+        else:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.time_projection = None
+        if time_embedding_dim is not None:
+            self.time_projection = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_embedding_dim, out_channels * 2),
+            )
+
+    def forward(self, x: Tensor, time_embedding: Tensor | None = None) -> Tensor:
+        residual = self.shortcut(x)
+        x = self.norm1(x)
+        x = self.activation1(x)
+        x = self.conv1(x)
+        x = self.norm2(x)
+        if self.time_projection is not None:
+            if time_embedding is None:
+                raise ValueError("time_embedding is required when time conditioning is enabled")
+            scale_shift = self.time_projection(time_embedding).unsqueeze(-1).unsqueeze(-1)
+            scale, shift = scale_shift.chunk(2, dim=1)
+            x = x * (1 + scale) + shift
+        x = self.activation2(x)
+        x = self.conv2(x)
+        return x + residual
+
+
+class UNetDownBlock(nn.Module):
+    """Downsample once, then apply a time-conditioned residual block."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        time_embedding_dim: int | None = None,
+        norm: NormalizationName = "group",
+        norm_groups: int = 8,
+        activation: ActivationName = "silu",
+    ) -> None:
+        super().__init__()
+        self.downsample = ConvBlock(
+            in_channels,
+            out_channels,
+            stride=2,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+        self.refine = UNetResidualBlock(
+            out_channels,
+            out_channels,
+            time_embedding_dim=time_embedding_dim,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+
+    def forward(self, x: Tensor, time_embedding: Tensor | None = None) -> Tensor:
+        x = self.downsample(x)
+        x = self.refine(x, time_embedding)
+        return x
+
+
+class UNetUpBlock(nn.Module):
+    """Upsample decoder features and fuse them with the matching skip tensor."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        *,
+        time_embedding_dim: int | None = None,
+        norm: NormalizationName = "group",
+        norm_groups: int = 8,
+        activation: ActivationName = "silu",
+    ) -> None:
+        super().__init__()
+        self.upsample = nn.Upsample(
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False,
+        )
+        self.up_conv = ConvBlock(
+            in_channels,
+            out_channels,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+        self.fuse = UNetResidualBlock(
+            out_channels + skip_channels,
+            out_channels,
+            time_embedding_dim=time_embedding_dim,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        skip: Tensor,
+        time_embedding: Tensor | None = None,
+    ) -> Tensor:
+        x = self.upsample(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.up_conv(x)
+        x = torch.cat([skip, x], dim=1)
+        return self.fuse(x, time_embedding)
+
+
+class UNet(nn.Module):
+    """A basic UNet with diffusion-style time conditioning."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        channel_dims: list[int],
+        *,
+        bottleneck_channels: int | None = None,
+        time_embedding_dim: int | None = None,
+        norm: NormalizationName = "group",
+        norm_groups: int = 8,
+        activation: ActivationName = "silu",
+    ) -> None:
+        super().__init__()
+        if not channel_dims:
+            raise ValueError("channel_dims must contain at least one channel dimension")
+
+        if bottleneck_channels is None:
+            bottleneck_channels = channel_dims[-1] * 2
+        if time_embedding_dim is None:
+            time_embedding_dim = channel_dims[0] * 4
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.channel_dims = channel_dims
+        self.bottleneck_channels = bottleneck_channels
+        self.time_embedding_dim = time_embedding_dim
+        self.time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embedding_dim, time_embedding_dim),
+            nn.SiLU(),
+            nn.Linear(time_embedding_dim, time_embedding_dim),
+        )
+
+        self.stem = UNetResidualBlock(
+            in_channels,
+            channel_dims[0],
+            time_embedding_dim=time_embedding_dim,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+
+        down_blocks: list[nn.Module] = []
+        for prev_channels, next_channels in zip(channel_dims, channel_dims[1:]):
+            down_blocks.append(
+                UNetDownBlock(
+                    prev_channels,
+                    next_channels,
+                    time_embedding_dim=time_embedding_dim,
+                    norm=norm,
+                    norm_groups=norm_groups,
+                    activation=activation,
+                )
+            )
+        self.down_blocks = nn.ModuleList(down_blocks)
+
+        self.bottleneck = UNetResidualBlock(
+            channel_dims[-1],
+            bottleneck_channels,
+            time_embedding_dim=time_embedding_dim,
+            norm=norm,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+
+        up_blocks: list[nn.Module] = []
+        decoder_channels = bottleneck_channels
+        for skip_channels in reversed(channel_dims[:-1]):
+            up_blocks.append(
+                UNetUpBlock(
+                    decoder_channels,
+                    skip_channels,
+                    skip_channels,
+                    time_embedding_dim=time_embedding_dim,
+                    norm=norm,
+                    norm_groups=norm_groups,
+                    activation=activation,
+                )
+            )
+            decoder_channels = skip_channels
+        self.up_blocks = nn.ModuleList(up_blocks)
+
+        self.head = nn.Conv2d(decoder_channels, out_channels, kernel_size=1)
+        nn.init.zeros_(self.head.weight)
+        if self.head.bias is not None:
+            nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: Tensor, t: Tensor) -> Tensor:
+        if t.ndim == 0:
+            t = t.expand(x.shape[0])
+        elif t.ndim == 2 and t.shape[-1] == 1:
+            t = t.squeeze(-1)
+        elif t.ndim != 1:
+            raise ValueError(f"Expected t to have shape (batch,) or (batch, 1), got {tuple(t.shape)}")
+        if t.shape[0] != x.shape[0]:
+            raise ValueError(f"Expected t batch size {x.shape[0]}, got {t.shape[0]}")
+
+        time_embedding = self.time_embedding(t.to(device=x.device))
+        time_embedding = time_embedding.to(dtype=self.time_mlp[0].weight.dtype)
+        time_embedding = self.time_mlp(time_embedding).to(dtype=x.dtype)
+        skips: list[Tensor] = []
+
+        x = self.stem(x, time_embedding)
+        skips.append(x)
+
+        for down_block in self.down_blocks:
+            x = down_block(x, time_embedding)
+            skips.append(x)
+
+        x = self.bottleneck(x, time_embedding)
+
+        for up_block, skip in zip(self.up_blocks, reversed(skips[:-1])):
+            x = up_block(x, skip, time_embedding)
+
+        x = self.head(x)
+        return x
+
+
 __all__ = [
     "ActivationName",
     "ConvBlock",
+    "NormalizationName",
     "ResidualConvBlock",
     "ResNet",
+    "SinusoidalTimeEmbedding",
+    "UNet",
+    "UNetDownBlock",
+    "UNetResidualBlock",
+    "UNetUpBlock",
     "build_activation",
+    "build_norm",
 ]
