@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from p4mresnet import (
     P4MP4MConvBlock,
+    P4MResNet,
     P4MUNet,
     P4MUNetDownBlock,
     P4MUNetLiftBlock,
@@ -22,6 +23,7 @@ from p4mresnet import (
 )
 from p4resnet import (
     P4P4ConvBlock,
+    P4ResNet,
     P4UNet,
     P4UNetDownBlock,
     P4UNetLiftBlock,
@@ -176,6 +178,18 @@ def make_p4_unet() -> P4UNet:
     ).eval().to(dtype=torch.float64)
 
 
+def make_p4_resnet(*, downsample_mode: str = "stride") -> P4ResNet:
+    return P4ResNet(
+        n_blocks=2,
+        in_channels=3,
+        num_classes=10,
+        channel_dims=[8, 16, 32],
+        norm="identity",
+        downsample_mode=downsample_mode,
+        activation=None,
+    ).eval().to(dtype=torch.float64)
+
+
 def make_p4m_unet_lift_block() -> P4MUNetLiftBlock:
     return P4MUNetLiftBlock(
         in_channels=3,
@@ -224,6 +238,18 @@ def make_p4m_unet() -> P4MUNet:
         channel_dims=[8, 16],
         time_embedding_dim=16,
         norm="identity",
+        activation=None,
+    ).eval().to(dtype=torch.float64)
+
+
+def make_p4m_resnet(*, downsample_mode: str = "stride") -> P4MResNet:
+    return P4MResNet(
+        n_blocks=2,
+        in_channels=3,
+        num_classes=10,
+        channel_dims=[8, 16, 32],
+        norm="identity",
+        downsample_mode=downsample_mode,
         activation=None,
     ).eval().to(dtype=torch.float64)
 
@@ -332,6 +358,29 @@ def test_p4_unet() -> None:
         assert_equivariant(f"P4UNet rotation k={k}", lhs, rhs)
 
 
+def test_p4_resnet() -> None:
+    model = make_p4_resnet()
+    # Use an odd spatial size so the stride-2 stages stay aligned under rot90.
+    x = torch.randn(2, 3, 33, 33, dtype=torch.float64)
+
+    for k in range(4):
+        lhs = model(rotate_z2(x, k))
+        rhs = model(x)
+        assert_equivariant(f"P4ResNet rotation k={k}", lhs, rhs)
+
+
+def test_p4_resnet_pool_downsampling() -> None:
+    # Non-overlapping 2x2 pooling aligns with the CIFAR-sized even grid.
+    x = torch.randn(2, 3, 32, 32, dtype=torch.float64)
+
+    for downsample_mode in ("avgpool", "maxpool"):
+        model = make_p4_resnet(downsample_mode=downsample_mode)
+        for k in range(4):
+            lhs = model(rotate_z2(x, k))
+            rhs = model(x)
+            assert_equivariant(f"P4ResNet {downsample_mode} rotation k={k}", lhs, rhs)
+
+
 def test_p4m_unet_lift_block() -> None:
     block = make_p4m_unet_lift_block()
     x = torch.randn(2, 3, 15, 15, dtype=torch.float64)
@@ -408,6 +457,37 @@ def test_p4m_unet() -> None:
     assert_equivariant("P4MUNet reflection", lhs, rhs)
 
 
+def test_p4m_resnet() -> None:
+    model = make_p4m_resnet()
+    # Use an odd spatial size so the stride-2 stages stay aligned under group actions.
+    x = torch.randn(2, 3, 33, 33, dtype=torch.float64)
+
+    for k in range(4):
+        lhs = model(rotate_z2(x, k))
+        rhs = model(x)
+        assert_equivariant(f"P4MResNet rotation k={k}", lhs, rhs)
+
+    lhs = model(reflect_z2(x))
+    rhs = model(x)
+    assert_equivariant("P4MResNet reflection", lhs, rhs)
+
+
+def test_p4m_resnet_pool_downsampling() -> None:
+    # Non-overlapping 2x2 pooling aligns with the CIFAR-sized even grid.
+    x = torch.randn(2, 3, 32, 32, dtype=torch.float64)
+
+    for downsample_mode in ("avgpool", "maxpool"):
+        model = make_p4m_resnet(downsample_mode=downsample_mode)
+        for k in range(4):
+            lhs = model(rotate_z2(x, k))
+            rhs = model(x)
+            assert_equivariant(f"P4MResNet {downsample_mode} rotation k={k}", lhs, rhs)
+
+        lhs = model(reflect_z2(x))
+        rhs = model(x)
+        assert_equivariant(f"P4MResNet {downsample_mode} reflection", lhs, rhs)
+
+
 def main() -> None:
     set_seed(0)
     torch.set_grad_enabled(False)
@@ -422,11 +502,15 @@ def main() -> None:
     test_p4_unet_down_block()
     test_p4_unet_up_block()
     test_p4_unet()
+    test_p4_resnet()
+    test_p4_resnet_pool_downsampling()
     test_p4m_unet_lift_block()
     test_p4m_unet_residual_block()
     test_p4m_unet_down_block()
     test_p4m_unet_up_block()
     test_p4m_unet()
+    test_p4m_resnet()
+    test_p4m_resnet_pool_downsampling()
     print("All equivariance checks passed.")
 
 

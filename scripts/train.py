@@ -39,6 +39,7 @@ DATASET_CHOICES = ("mnist-rot", "cifar10")
 MODEL_CHOICES = ("resnet", "p4resnet", "p4mresnet")
 MODEL_SIZE_CHOICES = ("small", "base", "large")
 OPTIMIZER_CHOICES = ("adamw", "sgd")
+DOWNSAMPLE_MODE_CHOICES = ("stride", "avgpool", "maxpool")
 DATASET_SPECS: dict[str, dict[str, int]] = {
     "mnist-rot": {"in_channels": 1, "num_classes": 10},
     "cifar10": {"in_channels": 3, "num_classes": 10},
@@ -158,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[32, 64, 128],
         help="Stage widths for the selected network.",
+    )
+    parser.add_argument(
+        "--downsample-mode",
+        choices=DOWNSAMPLE_MODE_CHOICES,
+        default="stride",
+        help="How stage transitions downsample spatial resolution.",
     )
     parser.add_argument(
         "--num-workers",
@@ -367,6 +374,7 @@ def build_model(args: argparse.Namespace) -> nn.Module:
         "in_channels": dataset_spec["in_channels"],
         "num_classes": dataset_spec["num_classes"],
         "channel_dims": args.channel_dims,
+        "downsample_mode": args.downsample_mode,
     }
     if args.model == "resnet":
         return ResNet(**common_kwargs)

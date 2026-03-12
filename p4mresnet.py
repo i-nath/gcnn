@@ -4,10 +4,12 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from resnet import (
     ActivationName,
+    DownsampleMode,
     NormalizationName,
     SinusoidalTimeEmbedding,
     build_activation,
     build_norm,
+    build_spatial_downsample3d,
 )
 
 
@@ -215,13 +217,16 @@ class P4MResidualConvBlock(nn.Module):
         stride: int = 1,
         norm: NormalizationName = "batch",
         norm_groups: int = 8,
+        downsample_mode: DownsampleMode = "stride",
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
+        conv_stride = stride if downsample_mode == "stride" else 1
+        self.downsample = build_spatial_downsample3d(downsample_mode, stride)
         self.block1 = P4MP4MConvBlock(
             in_channels,
             out_channels,
-            stride=stride,
+            stride=conv_stride,
             norm=norm,
             norm_groups=norm_groups,
             activation=activation,
@@ -237,12 +242,19 @@ class P4MResidualConvBlock(nn.Module):
             self.shortcut = nn.Identity()
         else:
             self.shortcut = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=(1, stride, stride), bias=False),
+                nn.Conv3d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=(1, conv_stride, conv_stride),
+                    bias=False,
+                ),
                 build_norm3d(norm, out_channels, num_groups=norm_groups),
             )
         self.activation = build_activation(activation)
 
     def forward(self, x: Tensor) -> Tensor:
+        x = self.downsample(x)
         residual = self.shortcut(x)  # (bs, out_c, out_h, out_w)
         x = self.block1(x)  # (bs, out_c, out_h, out_w)
         x = self.block2(x)  # (bs, out_c, out_h, out_w)
@@ -261,6 +273,7 @@ class P4MResNet(nn.Module):
         *,
         norm: NormalizationName = "batch",
         norm_groups: int = 8,
+        downsample_mode: DownsampleMode = "stride",
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
@@ -273,6 +286,7 @@ class P4MResNet(nn.Module):
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.channel_dims = channel_dims
+        self.downsample_mode = downsample_mode
 
         self.stem = P4MZ2ConvBlock(
             in_channels,
@@ -293,6 +307,7 @@ class P4MResNet(nn.Module):
                 n_blocks=n_blocks,
                 norm=norm,
                 norm_groups=norm_groups,
+                downsample_mode=downsample_mode,
                 activation=activation,
             )
         )
@@ -306,6 +321,7 @@ class P4MResNet(nn.Module):
                     n_blocks=n_blocks,
                     norm=norm,
                     norm_groups=norm_groups,
+                    downsample_mode=downsample_mode,
                     activation=activation,
                 )
             )
@@ -323,6 +339,7 @@ class P4MResNet(nn.Module):
         n_blocks: int,
         norm: NormalizationName,
         norm_groups: int,
+        downsample_mode: DownsampleMode,
         activation: ActivationName,
     ) -> nn.Sequential:
         blocks = [
@@ -332,6 +349,7 @@ class P4MResNet(nn.Module):
                 stride=stride,
                 norm=norm,
                 norm_groups=norm_groups,
+                downsample_mode=downsample_mode,
                 activation=activation,
             )
         ]
@@ -343,6 +361,7 @@ class P4MResNet(nn.Module):
                     stride=1,
                     norm=norm,
                     norm_groups=norm_groups,
+                    downsample_mode="stride",
                     activation=activation,
                 )
             )

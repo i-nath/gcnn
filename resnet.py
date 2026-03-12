@@ -8,6 +8,7 @@ from torch.nn import functional as F
 
 ActivationName = Literal["relu", "gelu", "silu", "tanh", "identity"] | None
 NormalizationName = Literal["batch", "group", "identity"] | None
+DownsampleMode = Literal["stride", "avgpool", "maxpool"]
 
 def build_activation(name: ActivationName) -> nn.Module:
     """Create a small activation module from a string name."""
@@ -43,6 +44,33 @@ def build_norm(
             groups -= 1
         return nn.GroupNorm(groups, num_channels)
     raise ValueError(f"Unsupported normalization: {name}")
+
+
+def build_spatial_downsample2d(mode: DownsampleMode, stride: int) -> nn.Module:
+    """Create a 2D spatial downsampling module."""
+    if stride == 1:
+        return nn.Identity()
+    if mode == "stride":
+        return nn.Identity()
+    if mode == "avgpool":
+        return nn.AvgPool2d(kernel_size=stride, stride=stride)
+    if mode == "maxpool":
+        return nn.MaxPool2d(kernel_size=stride, stride=stride)
+    raise ValueError(f"Unsupported downsample mode: {mode}")
+
+
+def build_spatial_downsample3d(mode: DownsampleMode, stride: int) -> nn.Module:
+    """Create a 3D downsampling module over spatial dimensions only."""
+    if stride == 1:
+        return nn.Identity()
+    if mode == "stride":
+        return nn.Identity()
+    kernel_size = (1, stride, stride)
+    if mode == "avgpool":
+        return nn.AvgPool3d(kernel_size=kernel_size, stride=kernel_size)
+    if mode == "maxpool":
+        return nn.MaxPool3d(kernel_size=kernel_size, stride=kernel_size)
+    raise ValueError(f"Unsupported downsample mode: {mode}")
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -120,13 +148,16 @@ class ResidualConvBlock(nn.Module):
         *,
         stride: int = 1,
         norm: NormalizationName = "batch",
+        downsample_mode: DownsampleMode = "stride",
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
+        conv_stride = stride if downsample_mode == "stride" else 1
+        self.downsample = build_spatial_downsample2d(downsample_mode, stride)
         self.block1 = ConvBlock(
             in_channels,
             out_channels,
-            stride=stride,
+            stride=conv_stride,
             norm=norm,
             activation=activation,
         )
@@ -140,12 +171,19 @@ class ResidualConvBlock(nn.Module):
             self.shortcut = nn.Identity()
         else:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=conv_stride,
+                    bias=False,
+                ),
                 build_norm(norm, out_channels),
             )
         self.activation = build_activation(activation)
 
     def forward(self, x: Tensor) -> Tensor:
+        x = self.downsample(x)
         residual = self.shortcut(x)  # (bs, out_c, out_h, out_w)
         x = self.block1(x)  # (bs, out_c, out_h, out_w)
         x = self.block2(x)  # (bs, out_c, out_h, out_w)
@@ -162,6 +200,7 @@ class ResNet(nn.Module):
         num_classes: int,
         channel_dims: list[int],
         *,
+        downsample_mode: DownsampleMode = "stride",
         activation: ActivationName = "relu",
     ) -> None:
         super().__init__()
@@ -174,6 +213,7 @@ class ResNet(nn.Module):
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.channel_dims = channel_dims
+        self.downsample_mode = downsample_mode
 
         self.stem = nn.Conv2d(
             in_channels,
@@ -194,6 +234,7 @@ class ResNet(nn.Module):
                 stride=1,
                 n_blocks=n_blocks,
                 norm="batch",
+                downsample_mode=downsample_mode,
                 activation=activation,
             )
         )
@@ -206,6 +247,7 @@ class ResNet(nn.Module):
                     stride=2,
                     n_blocks=n_blocks,
                     norm="batch",
+                    downsample_mode=downsample_mode,
                     activation=activation,
                 )
             )
@@ -222,6 +264,7 @@ class ResNet(nn.Module):
         stride: int,
         n_blocks: int,
         norm: NormalizationName,
+        downsample_mode: DownsampleMode,
         activation: ActivationName,
     ) -> nn.Sequential:
         blocks = [
@@ -230,6 +273,7 @@ class ResNet(nn.Module):
                 out_channels,
                 stride=stride,
                 norm=norm,
+                downsample_mode=downsample_mode,
                 activation=activation,
             )
         ]
@@ -240,6 +284,7 @@ class ResNet(nn.Module):
                     out_channels,
                     stride=1,
                     norm=norm,
+                    downsample_mode="stride",
                     activation=activation,
                 )
             )
@@ -525,6 +570,7 @@ class UNet(nn.Module):
 __all__ = [
     "ActivationName",
     "ConvBlock",
+    "DownsampleMode",
     "NormalizationName",
     "ResidualConvBlock",
     "ResNet",
@@ -535,4 +581,6 @@ __all__ = [
     "UNetUpBlock",
     "build_activation",
     "build_norm",
+    "build_spatial_downsample2d",
+    "build_spatial_downsample3d",
 ]
